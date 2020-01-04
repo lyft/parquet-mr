@@ -104,7 +104,7 @@
 
     <!-- parquet-cli dependencies -->
     <opencsv.version>2.3</opencsv.version>
-    <jackson2.version>2.9.8</jackson2.version>
+    <jackson2.version>2.10.0</jackson2.version>
     <jcommander.version>1.35</jcommander.version>
     <commons-codec.version>1.10</commons-codec.version>
   </properties>
@@ -577,7 +577,7 @@
         <!-- test hadoop-1 with the same jars that were produced for default profile -->
         <maven.main.skip>true</maven.main.skip>
         <hadoop.version>${hadoop1.version}</hadoop.version>
-        <pig.classifier />
+        <pig.classifier/>
       </properties>
     </profile>
     <profile>
