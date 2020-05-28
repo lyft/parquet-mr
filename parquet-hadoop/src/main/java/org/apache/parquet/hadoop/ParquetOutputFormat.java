@@ -310,7 +310,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
 
     WriteContext init = writeSupport.init(conf);
     ParquetFileWriter w = new ParquetFileWriter(
-        conf, init.getSchema(), file, Mode.CREATE, blockSize, maxPaddingSize);
+        conf, init.getSchema(), file, Mode.OVERWRITE, blockSize, maxPaddingSize);
     w.start();
 
     float maxLoad = conf.getFloat(ParquetOutputFormat.MEMORY_POOL_RATIO,
