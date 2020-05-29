@@ -39,7 +39,7 @@ wget -nv http://archive.apache.org/dist/thrift/0.12.0/thrift-0.12.0.tar.gz
 tar xzf thrift-0.12.0.tar.gz
 cd thrift-0.12.0
 chmod +x ./configure
-./configure --disable-gen-erl --disable-gen-hs --without-ruby --without-haskell --without-erlang --without-php --without-nodejs
+./configure --disable-libs
 sudo make install
 ```
 
@@ -139,29 +139,29 @@ The build runs in [Travis CI](http://travis-ci.org/apache/parquet-mr):
 [![Build Status](https://travis-ci.org/apache/parquet-mr.svg?branch=master)](http://travis-ci.org/apache/parquet-mr)
 
 ## Add Parquet as a dependency in Maven
-The current release is version `1.10.0`
+The current release is version `1.11.0`
 
 ```xml
   <dependencies>
     <dependency>
       <groupId>org.apache.parquet</groupId>
       <artifactId>parquet-common</artifactId>
-      <version>1.10.0</version>
+      <version>1.11.0</version>
     </dependency>
     <dependency>
       <groupId>org.apache.parquet</groupId>
       <artifactId>parquet-encoding</artifactId>
-      <version>1.10.0</version>
+      <version>1.11.0</version>
     </dependency>
     <dependency>
       <groupId>org.apache.parquet</groupId>
       <artifactId>parquet-column</artifactId>
-      <version>1.10.0</version>
+      <version>1.11.0</version>
     </dependency>
     <dependency>
       <groupId>org.apache.parquet</groupId>
       <artifactId>parquet-hadoop</artifactId>
-      <version>1.10.0</version>
+      <version>1.11.0</version>
     </dependency>
   </dependencies>
 ```

@@ -19,6 +19,7 @@
 package org.apache.parquet.hadoop;
 
 import static org.apache.parquet.bytes.BytesUtils.readIntLittleEndian;
+import static org.apache.parquet.filter2.compat.RowGroupFilter.FilterLevel.BLOOMFILTER;
 import static org.apache.parquet.filter2.compat.RowGroupFilter.FilterLevel.DICTIONARY;
 import static org.apache.parquet.filter2.compat.RowGroupFilter.FilterLevel.STATISTICS;
 import static org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FILTER;
@@ -30,6 +31,7 @@ import static org.apache.parquet.hadoop.ParquetFileWriter.PARQUET_COMMON_METADAT
 import static org.apache.parquet.hadoop.ParquetFileWriter.PARQUET_METADATA_FILE;
 
 import java.io.Closeable;
+import java.io.InputStream;
 import java.io.IOException;
 import java.io.SequenceInputStream;
 import java.nio.ByteBuffer;
@@ -50,6 +52,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.zip.CRC32;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -67,9 +70,12 @@ import org.apache.parquet.column.page.DataPageV2;
 import org.apache.parquet.column.page.DictionaryPage;
 import org.apache.parquet.column.page.DictionaryPageReadStore;
 import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.column.values.bloomfilter.BlockSplitBloomFilter;
+import org.apache.parquet.column.values.bloomfilter.BloomFilter;
 import org.apache.parquet.compression.CompressionCodecFactory.BytesInputDecompressor;
 import org.apache.parquet.filter2.compat.FilterCompat;
 import org.apache.parquet.filter2.compat.RowGroupFilter;
+import org.apache.parquet.format.BloomFilterHeader;
 import org.apache.parquet.format.DataPageHeader;
 import org.apache.parquet.format.DataPageHeaderV2;
 import org.apache.parquet.format.DictionaryPageHeader;
@@ -112,6 +118,8 @@ public class ParquetFileReader implements Closeable {
   public static String PARQUET_READ_PARALLELISM = "parquet.metadata.read.parallelism";
 
   private final ParquetMetadataConverter converter;
+
+  private final CRC32 crc;
 
   /**
    * for files provided, check if there's a summary file.
@@ -156,30 +164,27 @@ public class ParquetFileReader implements Closeable {
     // read corresponding summary files if they exist
     List<Callable<Map<Path, Footer>>> summaries = new ArrayList<Callable<Map<Path, Footer>>>();
     for (final Path path : parents) {
-      summaries.add(new Callable<Map<Path, Footer>>() {
-        @Override
-        public Map<Path, Footer> call() throws Exception {
-          ParquetMetadata mergedMetadata = readSummaryMetadata(configuration, path, skipRowGroups);
-          if (mergedMetadata != null) {
-            final List<Footer> footers;
-            if (skipRowGroups) {
-              footers = new ArrayList<Footer>();
-              for (FileStatus f : partFiles) {
-                footers.add(new Footer(f.getPath(), mergedMetadata));
-              }
-            } else {
-              footers = footersFromSummaryFile(path, mergedMetadata);
+      summaries.add(() -> {
+        ParquetMetadata mergedMetadata = readSummaryMetadata(configuration, path, skipRowGroups);
+        if (mergedMetadata != null) {
+          final List<Footer> footers;
+          if (skipRowGroups) {
+            footers = new ArrayList<Footer>();
+            for (FileStatus f : partFiles) {
+              footers.add(new Footer(f.getPath(), mergedMetadata));
             }
-            Map<Path, Footer> map = new HashMap<Path, Footer>();
-            for (Footer footer : footers) {
-              // the folder may have been moved
-              footer = new Footer(new Path(path, footer.getFile().getName()), footer.getParquetMetadata());
-              map.put(footer.getFile(), footer);
-            }
-            return map;
           } else {
-            return Collections.emptyMap();
+            footers = footersFromSummaryFile(path, mergedMetadata);
           }
+          Map<Path, Footer> map = new HashMap<Path, Footer>();
+          for (Footer footer : footers) {
+            // the folder may have been moved
+            footer = new Footer(new Path(path, footer.getFile().getName()), footer.getParquetMetadata());
+            map.put(footer.getFile(), footer);
+          }
+          return map;
+        } else {
+          return Collections.emptyMap();
         }
       });
     }
@@ -264,14 +269,11 @@ public class ParquetFileReader implements Closeable {
   public static List<Footer> readAllFootersInParallel(final Configuration configuration, List<FileStatus> partFiles, final boolean skipRowGroups) throws IOException {
     List<Callable<Footer>> footers = new ArrayList<Callable<Footer>>();
     for (final FileStatus currentFile : partFiles) {
-      footers.add(new Callable<Footer>() {
-        @Override
-        public Footer call() throws Exception {
-          try {
-            return new Footer(currentFile.getPath(), readFooter(configuration, currentFile, filter(skipRowGroups)));
-          } catch (IOException e) {
-            throw new IOException("Could not read footer for file " + currentFile, e);
-          }
+      footers.add(() -> {
+        try {
+          return new Footer(currentFile.getPath(), readFooter(configuration, currentFile, filter(skipRowGroups)));
+        } catch (IOException e) {
+          throw new IOException("Could not read footer for file " + currentFile, e);
         }
       });
     }
@@ -517,11 +519,10 @@ public class ParquetFileReader implements Closeable {
 
   private static final ParquetMetadata readFooter(InputFile file, ParquetReadOptions options, SeekableInputStream f, ParquetMetadataConverter converter) throws IOException {
     long fileLen = file.getLength();
-    String filePath = file.toString();
     LOG.debug("File length {}", fileLen);
     int FOOTER_LENGTH_SIZE = 4;
     if (fileLen < MAGIC.length + FOOTER_LENGTH_SIZE + MAGIC.length) { // MAGIC + data + footer + footerIndex + MAGIC
-      throw new RuntimeException(filePath + " is not a Parquet file (too small length: " + fileLen + ")");
+      throw new RuntimeException(file.toString() + " is not a Parquet file (too small length: " + fileLen + ")");
     }
     long footerLengthIndex = fileLen - FOOTER_LENGTH_SIZE - MAGIC.length;
     LOG.debug("reading footer index at {}", footerLengthIndex);
@@ -531,7 +532,7 @@ public class ParquetFileReader implements Closeable {
     byte[] magic = new byte[MAGIC.length];
     f.readFully(magic);
     if (!Arrays.equals(MAGIC, magic)) {
-      throw new RuntimeException(filePath + " is not a Parquet file. expected magic number at tail " + Arrays.toString(MAGIC) + " but found " + Arrays.toString(magic));
+      throw new RuntimeException(file.toString() + " is not a Parquet file. expected magic number at tail " + Arrays.toString(MAGIC) + " but found " + Arrays.toString(magic));
     }
     long footerIndex = footerLengthIndex - footerLength;
     LOG.debug("read footer length: {}, footer index: {}", footerLength, footerIndex);
@@ -539,7 +540,14 @@ public class ParquetFileReader implements Closeable {
       throw new RuntimeException("corrupted file: the footer index is not within the file: " + footerIndex);
     }
     f.seek(footerIndex);
-    return converter.readParquetMetadata(f, options.getMetadataFilter());
+    // Read all the footer bytes in one time to avoid multiple read operations,
+    // since it can be pretty time consuming for a single read operation in HDFS.
+    ByteBuffer footerBytesBuffer = ByteBuffer.allocate(footerLength);
+    f.readFully(footerBytesBuffer);
+    LOG.debug("Finished to read all footer bytes.");
+    footerBytesBuffer.flip();
+    InputStream footerBytesStream = ByteBufferInputStream.wrap(footerBytesBuffer);
+    return converter.readParquetMetadata(footerBytesStream, options.getMetadataFilter());
   }
 
   /**
@@ -659,6 +667,7 @@ public class ParquetFileReader implements Closeable {
     for (ColumnDescriptor col : columns) {
       paths.put(ColumnPath.get(col.getPath()), col);
     }
+    this.crc = options.usePageChecksumVerification() ? new CRC32() : null;
   }
 
   /**
@@ -695,6 +704,7 @@ public class ParquetFileReader implements Closeable {
     for (ColumnDescriptor col : footer.getFileMetaData().getSchema().getColumns()) {
       paths.put(ColumnPath.get(col.getPath()), col);
     }
+    this.crc = options.usePageChecksumVerification() ? new CRC32() : null;
   }
 
   public ParquetFileReader(InputFile file, ParquetReadOptions options) throws IOException {
@@ -717,6 +727,7 @@ public class ParquetFileReader implements Closeable {
     for (ColumnDescriptor col : footer.getFileMetaData().getSchema().getColumns()) {
       paths.put(ColumnPath.get(col.getPath()), col);
     }
+    this.crc = options.usePageChecksumVerification() ? new CRC32() : null;
   }
 
   private static <T> List<T> listWithNulls(int size) {
@@ -750,7 +761,7 @@ public class ParquetFileReader implements Closeable {
     return total;
   }
 
-  long getFilteredRecordCount() {
+  public long getFilteredRecordCount() {
     if (!options.useColumnIndexFilter()) {
       return getRecordCount();
     }
@@ -784,6 +795,10 @@ public class ParquetFileReader implements Closeable {
 
     if (options.useDictionaryFilter()) {
       levels.add(DICTIONARY);
+    }
+
+    if (options.useBloomFilter()) {
+      levels.add(BLOOMFILTER);
     }
 
     FilterCompat.Filter recordFilter = options.getRecordFilter();
@@ -1043,6 +1058,48 @@ public class ParquetFileReader implements Closeable {
         converter.getEncoding(dictHeader.getEncoding()));
   }
 
+  public BloomFilterReader getBloomFilterDataReader(BlockMetaData block) {
+    return new BloomFilterReader(this, block);
+  }
+
+  /**
+   * Reads Bloom filter data for the given column chunk.
+   *
+   * @param meta a column's ColumnChunkMetaData to read the dictionary from
+   * @return an BloomFilter object.
+   * @throws IOException if there is an error while reading the Bloom filter.
+   */
+  public BloomFilter readBloomFilter(ColumnChunkMetaData meta) throws IOException {
+    long bloomFilterOffset = meta.getBloomFilterOffset();
+    f.seek(bloomFilterOffset);
+    BloomFilterHeader bloomFilterHeader;
+
+    // Read Bloom filter data header.
+    try {
+      bloomFilterHeader = Util.readBloomFilterHeader(f);
+    } catch (IOException e) {
+      LOG.warn("read no bloom filter");
+      return null;
+    }
+
+    int numBytes = bloomFilterHeader.getNumBytes();
+    if (numBytes <= 0 || numBytes > BlockSplitBloomFilter.UPPER_BOUND_BYTES) {
+      LOG.warn("the read bloom filter size is wrong, size is {}", bloomFilterHeader.getNumBytes());
+      return null;
+    }
+
+    if (!bloomFilterHeader.getHash().isSetXXHASH() || !bloomFilterHeader.getAlgorithm().isSetBLOCK()
+      || !bloomFilterHeader.getCompression().isSetUNCOMPRESSED()) {
+      LOG.warn("the read bloom filter is not supported yet,  algorithm = {}, hash = {}, compression = {}",
+        bloomFilterHeader.getAlgorithm(), bloomFilterHeader.getHash(), bloomFilterHeader.getCompression());
+      return null;
+    }
+
+    byte[] bitset = new byte[numBytes];
+    f.readFully(bitset);
+    return new BlockSplitBloomFilter(bitset);
+  }
+
   /**
    * @param column
    *          the column chunk which the column index is to be returned for
@@ -1164,6 +1221,18 @@ public class ParquetFileReader implements Closeable {
     }
 
     /**
+     * Calculate checksum of input bytes, throw decoding exception if it does not match the provided
+     * reference crc
+     */
+    private void verifyCrc(int referenceCrc, byte[] bytes, String exceptionMsg) {
+      crc.reset();
+      crc.update(bytes);
+      if (crc.getValue() != ((long) referenceCrc & 0xffffffffL)) {
+        throw new ParquetDecodingException(exceptionMsg);
+      }
+    }
+
+    /**
      * Read all of the pages in a given column chunk.
      * @return the list of pages
      */
@@ -1178,36 +1247,54 @@ public class ParquetFileReader implements Closeable {
         PageHeader pageHeader = readPageHeader();
         int uncompressedPageSize = pageHeader.getUncompressed_page_size();
         int compressedPageSize = pageHeader.getCompressed_page_size();
+        final BytesInput pageBytes;
         switch (pageHeader.type) {
           case DICTIONARY_PAGE:
             // there is only one dictionary page per column chunk
             if (dictionaryPage != null) {
               throw new ParquetDecodingException("more than one dictionary page in column " + descriptor.col);
             }
+            pageBytes = this.readAsBytesInput(compressedPageSize);
+            if (options.usePageChecksumVerification() && pageHeader.isSetCrc()) {
+              verifyCrc(pageHeader.getCrc(), pageBytes.toByteArray(),
+                "could not verify dictionary page integrity, CRC checksum verification failed");
+            }
             DictionaryPageHeader dicHeader = pageHeader.getDictionary_page_header();
             dictionaryPage =
                 new DictionaryPage(
-                    this.readAsBytesInput(compressedPageSize),
+                    pageBytes,
                     uncompressedPageSize,
                     dicHeader.getNum_values(),
                     converter.getEncoding(dicHeader.getEncoding())
                     );
+            // Copy crc to new page, used for testing
+            if (pageHeader.isSetCrc()) {
+              dictionaryPage.setCrc(pageHeader.getCrc());
+            }
             break;
           case DATA_PAGE:
             DataPageHeader dataHeaderV1 = pageHeader.getData_page_header();
-            pagesInChunk.add(
-                new DataPageV1(
-                    this.readAsBytesInput(compressedPageSize),
-                    dataHeaderV1.getNum_values(),
-                    uncompressedPageSize,
-                    converter.fromParquetStatistics(
-                        getFileMetaData().getCreatedBy(),
-                        dataHeaderV1.getStatistics(),
-                        type),
-                    converter.getEncoding(dataHeaderV1.getRepetition_level_encoding()),
-                    converter.getEncoding(dataHeaderV1.getDefinition_level_encoding()),
-                    converter.getEncoding(dataHeaderV1.getEncoding())
-                    ));
+            pageBytes = this.readAsBytesInput(compressedPageSize);
+            if (options.usePageChecksumVerification() && pageHeader.isSetCrc()) {
+              verifyCrc(pageHeader.getCrc(), pageBytes.toByteArray(),
+                "could not verify page integrity, CRC checksum verification failed");
+            }
+            DataPageV1 dataPageV1 = new DataPageV1(
+              pageBytes,
+              dataHeaderV1.getNum_values(),
+              uncompressedPageSize,
+              converter.fromParquetStatistics(
+                getFileMetaData().getCreatedBy(),
+                dataHeaderV1.getStatistics(),
+                type),
+              converter.getEncoding(dataHeaderV1.getRepetition_level_encoding()),
+              converter.getEncoding(dataHeaderV1.getDefinition_level_encoding()),
+              converter.getEncoding(dataHeaderV1.getEncoding()));
+            // Copy crc to new page, used for testing
+            if (pageHeader.isSetCrc()) {
+              dataPageV1.setCrc(pageHeader.getCrc());
+            }
+            pagesInChunk.add(dataPageV1);
             valuesCountReadSoFar += dataHeaderV1.getNum_values();
             ++dataPageCountReadSoFar;
             break;
